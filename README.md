@@ -1,5 +1,6 @@
-# DME: Deep multimodal brain encoding
-This repository contains the Brain & AI team's submission for the Algonauts 2025 competition. It can be used for training and evaluating encoding models to predict fMRI brain responses to naturalistic video stimuli.
+# [TRIBE: TRImodal Brain Encoder for whole-brain fMRI response prediction](https://www.arxiv.org/abs/2507.22229)
+
+This repository contains the Brain & AI team's submission for the Algonauts 2025 competition. It can be used for training and evaluating encoding models to predict fMRI brain responses to naturalistic video stimuli. For more details, please refer to the companion paper [here](https://www.arxiv.org/abs/2507.22229).
 
 ## Create the environment
 
