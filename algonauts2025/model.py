@@ -9,6 +9,7 @@ import typing as tp
 import numpy as np
 import pydantic
 import torch
+import torch.nn.functional as F
 from data_utils.dataloader import SegmentData
 from einops import rearrange
 from modeling_utils.models.common import MlpConfig, SubjectLayers
@@ -24,6 +25,12 @@ class FmriEncoderConfig(pydantic.BaseModel):
     layer_aggregation: tp.Literal["mean", "cat"] = "cat"
     subject_embedding: bool = False
     modality_dropout: float = 0.0
+
+    # Contrastive alignment (e.g., with VJEPA2 video features)
+    contrastive_enabled: bool = False
+    contrastive_modalities: list[str] = ["video"]
+    contrastive_weight: float = 0.1
+    contrastive_temperature: float = 0.07
 
     def build(
         self, feature_dims: dict[int], n_outputs: int, n_output_timesteps: int
@@ -49,6 +56,7 @@ class FmriEncoder(nn.Module):
         self.feature_dims = feature_dims
         self.n_outputs = n_outputs
         self.projectors = nn.ModuleDict()
+        self.contrastive_heads = nn.ModuleDict()
         self.pooler = nn.AdaptiveAvgPool1d(n_output_timesteps)
         hidden = 3072
         for modality, tup in feature_dims.items():
@@ -72,6 +80,16 @@ class FmriEncoder(nn.Module):
             self.projectors[modality] = MlpConfig(
                 norm_layer="layer", activation_layer="gelu", dropout=0.0
             ).build(input_dim, output_dim)
+
+            # Build contrastive projection heads to map raw modality embeddings to hidden
+            # dimension independently of feature aggregation. Only for selected modalities.
+            if (
+                self.config.contrastive_enabled
+                and modality in self.config.contrastive_modalities
+            ):
+                self.contrastive_heads[modality] = MlpConfig(
+                    norm_layer="layer", activation_layer="gelu", dropout=0.0
+                ).build(input_dim, hidden)
         input_dim = (
             (hidden // len(feature_dims)) * len(feature_dims)
             if config.feature_aggregation == "cat"
@@ -154,3 +172,70 @@ class FmriEncoder(nn.Module):
             x = x + self.subject_embed(subject_id)
         x = self.encoder(x)
         return x
+
+    # --- Contrastive alignment helpers ---
+    def get_brain_latents(self, batch: SegmentData) -> torch.Tensor:
+        """Return sequence latents before predictor: shape [B, T, H]."""
+        x = self.aggregate_features(batch)  # B, T, H (hidden)
+        subject_id = batch.data.get("subject_id", None)
+        x = self.transformer_forward(x, subject_id)
+        return x
+
+    def _prepare_single_modality(self, batch: SegmentData, modality: str) -> torch.Tensor:
+        """Prepare a single modality tensor [B, T, D_mod] with layer aggregation."""
+        data = batch.data.get(modality, None)
+        if data is None:
+            raise KeyError(f"Modality '{modality}' not found in batch.data")
+        data = data.to(torch.float32)
+        if data.ndim == 3:
+            data = data.unsqueeze(1)  # B, 1, D, T
+        if self.config.layer_aggregation == "mean":
+            data = data.mean(dim=1)
+        elif self.config.layer_aggregation == "cat":
+            data = rearrange(data, "b l d t -> b (l d) t")
+        data = data.transpose(1, 2)  # B, T, D_mod
+        return data
+
+    def get_modality_latents(self, batch: SegmentData, modality: str) -> torch.Tensor:
+        """Project a single modality to hidden dimension: [B, T, H]."""
+        assert (
+            modality in self.contrastive_heads
+        ), f"No contrastive head found for modality '{modality}'"
+        data = self._prepare_single_modality(batch, modality)
+        proj = self.contrastive_heads[modality](data)  # B, T, H
+        return proj
+
+    @staticmethod
+    def _info_nce(q: torch.Tensor, k: torch.Tensor, tau: float = 0.07) -> torch.Tensor:
+        """
+        Symmetric InfoNCE over flattened [B,T,H] sequences.
+        q, k: [B, T, H]
+        """
+        bt, h = q.shape[0] * q.shape[1], q.shape[2]
+        q = F.normalize(q.reshape(bt, h), dim=-1)
+        k = F.normalize(k.reshape(bt, h), dim=-1)
+        logits = (q @ k.t()) / tau
+        labels = torch.arange(logits.size(0), device=logits.device)
+        loss_qk = F.cross_entropy(logits, labels)
+        loss_kq = F.cross_entropy(logits.t(), labels)
+        return 0.5 * (loss_qk + loss_kq)
+
+    def compute_contrastive_loss(self, batch: SegmentData) -> dict[str, torch.Tensor]:
+        """Compute InfoNCE losses per selected modality against brain latents."""
+        if not self.config.contrastive_enabled:
+            return {}
+        tau = self.config.contrastive_temperature
+        brain_latents = self.get_brain_latents(batch)  # B, T, H
+        losses: dict[str, torch.Tensor] = {}
+        for modality in self.config.contrastive_modalities:
+            if modality not in self.contrastive_heads or modality not in batch.data:
+                continue
+            mod_latents = self.get_modality_latents(batch, modality)
+            # If time dims mismatch, pool to match brain T
+            if mod_latents.size(1) != brain_latents.size(1):
+                mod_latents_t = mod_latents.transpose(1, 2)  # B, H, Tm
+                pool = nn.AdaptiveAvgPool1d(brain_latents.size(1))
+                mod_latents = pool(mod_latents_t).transpose(1, 2)
+            loss = self._info_nce(brain_latents, mod_latents, tau=tau)
+            losses[modality] = loss
+        return losses

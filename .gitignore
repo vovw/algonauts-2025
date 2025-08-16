@@ -2,3 +2,9 @@ data_utils/build/
 modeling_utils/build/
 **/*.egg-info
 **/*.pyc
+.venv/
+cache/
+results/
+wandb/
+*.ckpt
+**/__pycache__/

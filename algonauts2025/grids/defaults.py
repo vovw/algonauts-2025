@@ -98,6 +98,11 @@ default_config = {
         "feature_aggregation": "cat",
         "layer_aggregation": "cat",
         "subject_embedding": False,
+        # Enable contrastive alignment with video (VJEPA2) by default
+        "contrastive_enabled": True,
+        "contrastive_modalities": ["video"],
+        "contrastive_weight": 0.1,
+        "contrastive_temperature": 0.07,
     },
     "metrics": [
         {

@@ -54,6 +54,27 @@ class BrainModule(pl.LightningModule):
         y_pred_flat = rearrange(y_pred, "b d t -> (b t) d")
         y_true_flat = rearrange(y_true, "b d t -> (b t) d")
         loss = self.loss(y_pred_flat, y_true_flat)
+
+        # Optional contrastive alignment losses (e.g., with VJEPA2 video features)
+        if hasattr(self.model, "compute_contrastive_loss"):
+            contrastive_losses = self.model.compute_contrastive_loss(batch)
+            if contrastive_losses:
+                # Weight from model.config
+                weight = getattr(self.model.config, "contrastive_weight", 0.0)
+                total_contrastive = 0.0
+                for name, c_loss in contrastive_losses.items():
+                    self.log(
+                        f"{step_name}/contrastive/{name}",
+                        c_loss,
+                        on_step=False,
+                        on_epoch=True,
+                        logger=True,
+                        prog_bar=False,
+                        batch_size=y_pred.shape[0],
+                    )
+                    total_contrastive = total_contrastive + c_loss
+                total_contrastive = total_contrastive / max(1, len(contrastive_losses))
+                loss = loss + weight * total_contrastive
         log_kwargs = {
             "on_step": True if step_name == "train" else False,
             "on_epoch": True,
